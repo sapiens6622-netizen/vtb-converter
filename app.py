@@ -45,66 +45,105 @@ def parse_money(s: str):
         return None
 
 
+def find_column_x(words, column_name: str):
+    """Ищем слово column_name в шапке и возвращаем его x0."""
+    for w in words:
+        if w["text"].strip().lower() == column_name.lower():
+            return w["x0"]
+    return None
+
+
 def parse_operations(page) -> list:
     words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
     if not words:
         return []
 
-    # Находим все даты-маркеры (x ≈ 22, формат дд.мм.гггг)
+    # --- Отрезаем футер (всё после слова "Спасибо,") ---
+    cutoff = len(words)
+    for i, w in enumerate(words):
+        if w["text"].strip() == "Спасибо,":
+            cutoff = i
+            break
+    words = words[:cutoff]
+
+    # --- ШАГ 1. Находим координаты колонок из шапки ---
+    x_income = find_column_x(words, "Приход")
+    x_expense = find_column_x(words, "Расход")
+
+    if x_income is None or x_expense is None:
+        return []
+
+    # --- ШАГ 2. Находим даты-маркеры (x < 40) ---
     date_re = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
     markers = []
     for i, w in enumerate(words):
-        if date_re.match(w["text"]) and 15 < w["x0"] < 35:
+        if date_re.match(w["text"]) and w["x0"] < 40:
             markers.append(i)
 
     if not markers:
         return []
 
-    # Режем слова на блоки между маркерами
+    # --- ШАГ 3. Режем на блоки между маркерами ---
     rows = []
     for k, start_idx in enumerate(markers):
         end_idx = markers[k + 1] if k + 1 < len(markers) else len(words)
         block = words[start_idx:end_idx]
-        row = parse_block(block)
+        row = parse_block(block, x_income, x_expense)
         if row:
             rows.append(row)
     return rows
 
 
-def parse_block(block: list):
+def parse_block(block, x_income, x_expense):
     """block — список слов одной операции."""
     date = None
     income = None
     expense = None
     desc_words = []
 
+    # Границы колонок (расширенные, чтобы ловить сдвиги)
+    income_lo, income_hi = x_income - 25, x_income + 20
+    expense_lo, expense_hi = x_expense - 20, x_expense + 25
+
+    # Слова-футер на всякий случай
+    FOOTER_WORDS = {
+        "Спасибо,", "что", "Вы", "с", "нами!", "Всегда", "Ваш,",
+        "Банк", "ВТБ", "(ПАО)", "RUB", "₽",
+    }
+
     for w in block:
         text = w["text"]
         x = w["x0"]
 
-        # Дата (первое слово x≈22)
-        if date is None and re.match(r"^\d{2}\.\d{2}\.\d{4}$", text) and x < 35:
+        # Пропускаем футерные слова
+        if text in FOOTER_WORDS:
+            continue
+
+        # Дата (первое слово x<40)
+        if date is None and re.match(r"^\d{2}\.\d{2}\.\d{4}$", text) and x < 40:
             date = text
             continue
 
-        # Пропускаем время (x≈22, формат чч:мм:сс)
-        if re.match(r"^\d{2}:\d{2}:\d{2}$", text) and x < 35:
+        # Пропускаем время (x<40)
+        if re.match(r"^\d{2}:\d{2}:\d{2}$", text) and x < 40:
             continue
 
-        # Суммы: приход (x 230-275), расход (x 280-315)
-        if re.match(r"^[\d,]+\.\d{2}$", text):
+        # Суммы: приход/расход по координате колонки
+        if re.match(r"^-?[\d,]+\.\d{2}$", text):
             value = parse_money(text)
-            if value and 230 <= x <= 275:
-                income = value
-            elif value and 280 <= x <= 315:
-                expense = value
+            if value is not None:
+                if income_lo <= x <= income_hi:
+                    if value != 0:
+                        income = abs(value)
+                    continue
+                if expense_lo <= x <= expense_hi:
+                    if value != 0:
+                        expense = abs(value)
+                    continue
             continue
 
-        # Описание (x > 360)
-        if x > 360:
-            if text in ("RUB", "0", "0.00"):
-                continue
-            # Пропускаем номера страниц (одиночные цифры)
+        # Описание — всё, что правее колонки "Расход" + 20
+        if x > x_expense + 20:
             if re.match(r"^\d{1,2}$", text):
                 continue
             desc_words.append(text)
@@ -145,7 +184,6 @@ if uploaded_file is not None:
                 else:
                     df = pd.DataFrame(all_rows, columns=COLUMNS)
 
-                    # === Показываем балансы сверху ===
                     st.subheader("📋 Информация о счёте")
 
                     info_col1, info_col2 = st.columns(2)
@@ -167,7 +205,6 @@ if uploaded_file is not None:
 
                     output = BytesIO()
                     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                        # Лист с балансами (первым)
                         if meta:
                             meta_rows = []
                             for label in [
@@ -187,7 +224,6 @@ if uploaded_file is not None:
                             ws_meta.column_dimensions["A"].width = 30
                             ws_meta.column_dimensions["B"].width = 20
 
-                        # Лист с операциями
                         df.to_excel(writer, index=False, sheet_name="Операции")
                         ws = writer.sheets["Операции"]
 
