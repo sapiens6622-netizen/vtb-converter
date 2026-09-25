@@ -1,0 +1,217 @@
+import streamlit as st
+import pdfplumber
+import pandas as pd
+import re
+from io import BytesIO
+
+# ============ НАСТРОЙКИ ============
+COLUMNS = ["Дата", "Приход", "Расход", "Комментарий"]
+
+
+# ============ ИЗВЛЕЧЕНИЕ БАЛАНСОВ ============
+def extract_metadata(pdf) -> dict:
+    """Вытаскиваем только два баланса с 1-й страницы."""
+    meta = {}
+    text = pdf.pages[0].extract_text() or ""
+
+    for label in [
+        "Баланс на начало периода",
+        "Баланс на конец периода",
+    ]:
+        m = re.search(re.escape(label) + r"\s+([\d\s,]+\.\d{2})\s*RUB", text)
+        if m:
+            meta[label] = parse_money(m.group(1) + " RUB")
+
+    return meta
+
+
+# ============ ФУНКЦИИ ПАРСИНГА ============
+def clean(s):
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def parse_money(s: str):
+    """'4,000.00' -> 4000.0; '0' -> 0.0; '' -> None"""
+    if not s:
+        return None
+    s = s.replace("RUB", "").replace("₽", "").replace(",", "").replace(" ", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_operations(page) -> list:
+    words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+    if not words:
+        return []
+
+    # Находим все даты-маркеры (x ≈ 22, формат дд.мм.гггг)
+    date_re = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    markers = []
+    for i, w in enumerate(words):
+        if date_re.match(w["text"]) and 15 < w["x0"] < 35:
+            markers.append(i)
+
+    if not markers:
+        return []
+
+    # Режем слова на блоки между маркерами
+    rows = []
+    for k, start_idx in enumerate(markers):
+        end_idx = markers[k + 1] if k + 1 < len(markers) else len(words)
+        block = words[start_idx:end_idx]
+        row = parse_block(block)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def parse_block(block: list):
+    """block — список слов одной операции."""
+    date = None
+    income = None
+    expense = None
+    desc_words = []
+
+    for w in block:
+        text = w["text"]
+        x = w["x0"]
+
+        # Дата (первое слово x≈22)
+        if date is None and re.match(r"^\d{2}\.\d{2}\.\d{4}$", text) and x < 35:
+            date = text
+            continue
+
+        # Пропускаем время (x≈22, формат чч:мм:сс)
+        if re.match(r"^\d{2}:\d{2}:\d{2}$", text) and x < 35:
+            continue
+
+        # Суммы: приход (x 230-275), расход (x 280-315)
+        if re.match(r"^[\d,]+\.\d{2}$", text):
+            value = parse_money(text)
+            if value and 230 <= x <= 275:
+                income = value
+            elif value and 280 <= x <= 315:
+                expense = value
+            continue
+
+        # Описание (x > 360)
+        if x > 360:
+            if text in ("RUB", "0", "0.00"):
+                continue
+            # Пропускаем номера страниц (одиночные цифры)
+            if re.match(r"^\d{1,2}$", text):
+                continue
+            desc_words.append(text)
+
+    if not date:
+        return None
+
+    desc = " ".join(desc_words)
+    desc = re.sub(r"\s+", " ", desc).strip()
+
+    return [date, income, expense, desc]
+
+
+# ============ ИНТЕРФЕЙС STREAMLIT ============
+st.set_page_config(page_title="Конвертер выписок ВТБ", page_icon="📄")
+st.title("📄 Конвертер выписок ВТБ в Excel")
+st.markdown("Загрузите PDF-выписку ВТБ, чтобы получить таблицу операций в формате Excel.")
+
+uploaded_file = st.file_uploader("Выберите PDF-файл выписки", type=["pdf"])
+
+if uploaded_file is not None:
+    if st.button("Конвертировать в Excel"):
+        with st.spinner("Обрабатываю документ..."):
+            try:
+                with open("temp_uploaded.pdf", "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+
+                all_rows = []
+                meta = {}
+                with pdfplumber.open("temp_uploaded.pdf") as pdf:
+                    meta = extract_metadata(pdf)
+                    for page_num, page in enumerate(pdf.pages, start=1):
+                        rows = parse_operations(page)
+                        all_rows.extend(rows)
+
+                if not all_rows:
+                    st.warning("Не удалось найти операции. Проверьте формат PDF.")
+                else:
+                    df = pd.DataFrame(all_rows, columns=COLUMNS)
+
+                    # === Показываем балансы сверху ===
+                    st.subheader("📋 Информация о счёте")
+
+                    info_col1, info_col2 = st.columns(2)
+                    with info_col1:
+                        if "Баланс на начало периода" in meta:
+                            st.markdown(
+                                f"**Баланс на начало периода:** "
+                                f"{meta['Баланс на начало периода']:.2f} RUB"
+                            )
+                    with info_col2:
+                        if "Баланс на конец периода" in meta:
+                            st.markdown(
+                                f"**Баланс на конец периода:** "
+                                f"{meta['Баланс на конец периода']:.2f} RUB"
+                            )
+
+                    st.markdown("---")
+                    st.subheader("📊 Операции по счёту")
+
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                        # Лист с балансами (первым)
+                        if meta:
+                            meta_rows = []
+                            for label in [
+                                "Баланс на начало периода",
+                                "Баланс на конец периода",
+                            ]:
+                                if label in meta:
+                                    meta_rows.append([label, meta[label]])
+
+                            meta_df = pd.DataFrame(
+                                meta_rows, columns=["Параметр", "Значение"]
+                            )
+                            meta_df.to_excel(
+                                writer, index=False, sheet_name="Информация о счёте"
+                            )
+                            ws_meta = writer.sheets["Информация о счёте"]
+                            ws_meta.column_dimensions["A"].width = 30
+                            ws_meta.column_dimensions["B"].width = 20
+
+                        # Лист с операциями
+                        df.to_excel(writer, index=False, sheet_name="Операции")
+                        ws = writer.sheets["Операции"]
+
+                        for col, w in zip("ABCD", [14, 14, 14, 70]):
+                            ws.column_dimensions[col].width = w
+
+                        for cell in ws["A"][1:]:
+                            cell.number_format = "@"
+
+                        for col in ("B", "C"):
+                            for cell in ws[col][1:]:
+                                cell.number_format = "0"
+
+                    processed_data = output.getvalue()
+
+                    st.success(f"Готово! Найдено операций: {len(df)}")
+                    st.dataframe(df)
+
+                    st.download_button(
+                        label="⬇️ Скачать Excel",
+                        data=processed_data,
+                        file_name="выписка_втб.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+            except Exception as e:
+                st.error(f"Ошибка при обработке: {e}")
