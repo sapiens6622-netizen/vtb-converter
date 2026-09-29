@@ -58,7 +58,7 @@ def parse_operations(page) -> list:
     if not words:
         return []
 
-    # --- Отрезаем футер (всё после слова "Спасибо,") ---
+    # --- Отрезаем футер ---
     cutoff = len(words)
     for i, w in enumerate(words):
         if w["text"].strip() == "Спасибо,":
@@ -66,69 +66,98 @@ def parse_operations(page) -> list:
             break
     words = words[:cutoff]
 
-    # --- ШАГ 1. Находим координаты колонок из шапки ---
+    # --- Находим координаты колонок ---
     x_income = find_column_x(words, "Приход")
     x_expense = find_column_x(words, "Расход")
 
     if x_income is None or x_expense is None:
         return []
 
-    # --- ШАГ 2. Находим даты-маркеры (x < 40) ---
+    # --- Находим все даты-маркеры ---
     date_re = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
-    markers = []
+    date_markers = []
     for i, w in enumerate(words):
         if date_re.match(w["text"]) and w["x0"] < 40:
-            markers.append(i)
+            date_markers.append((i, w["top"]))
 
-    if not markers:
+    if not date_markers:
         return []
 
-    # --- ШАГ 3. Режем на блоки между маркерами ---
+    # --- Уникализация по top ---
+    boundaries = []
+    seen_tops = set()
+    for idx, top in date_markers:
+        top_rounded = round(top)
+        if top_rounded in seen_tops:
+            continue
+        seen_tops.add(top_rounded)
+        boundaries.append((idx, top_rounded))
+
+    if not boundaries:
+        return []
+
+    # --- Парсим каждый блок ---
     rows = []
-    for k, start_idx in enumerate(markers):
-        end_idx = markers[k + 1] if k + 1 < len(markers) else len(words)
+    for k, (start_idx, start_top) in enumerate(boundaries):
+        if k + 1 < len(boundaries):
+            end_idx = boundaries[k + 1][0]
+            end_top = boundaries[k + 1][1]
+        else:
+            end_idx = len(words)
+            end_top = 99999
+
         block = words[start_idx:end_idx]
-        row = parse_block(block, x_income, x_expense)
+        row = parse_block(block, x_income, x_expense, end_top)
         if row:
             rows.append(row)
     return rows
 
 
-def parse_block(block, x_income, x_expense):
+def parse_block(block, x_income, x_expense, end_top):
     """block — список слов одной операции."""
     date = None
     income = None
     expense = None
     desc_words = []
 
-    # Границы колонок (расширенные, чтобы ловить сдвиги)
-    income_lo, income_hi = x_income - 25, x_income + 20
-    expense_lo, expense_hi = x_expense - 20, x_expense + 25
+    # Расширенные границы колонок (расход расширен влево)
+    income_lo, income_hi = x_income - 30, x_income + 25
+    expense_lo, expense_hi = x_expense - 35, x_expense + 30
 
-    # Слова-футер на всякий случай
     FOOTER_WORDS = {
         "Спасибо,", "что", "Вы", "с", "нами!", "Всегда", "Ваш,",
-        "Банк", "ВТБ", "(ПАО)", "RUB", "₽",
+        "Банк", "ВТБ", "(ПАО)", "₽",
+    }
+    HEADER_WORDS = {
+        "Дата", "и", "время", "обработки", "банком", "Сумма",
+        "операции", "в", "валюте", "счета/карты", "Комиссия",
+        "Описание", "Приход", "Расход", "Наименование",
+        "получателя/", "Отправителя",
     }
 
     for w in block:
         text = w["text"]
         x = w["x0"]
 
-        # Пропускаем футерные слова
         if text in FOOTER_WORDS:
             continue
+        if text in HEADER_WORDS and date is None:
+            continue
+        if text == "RUB":
+            continue
 
-        # Дата (первое слово x<40)
+        # Дата
         if date is None and re.match(r"^\d{2}\.\d{2}\.\d{4}$", text) and x < 40:
             date = text
             continue
 
-        # Пропускаем время (x<40)
         if re.match(r"^\d{2}:\d{2}:\d{2}$", text) and x < 40:
             continue
 
-        # Суммы: приход/расход по координате колонки
+        if re.match(r"^\d{2}\.\d{2}\.\d{4}$", text) and 50 < x < 130:
+            continue
+
+        # Суммы
         if re.match(r"^-?[\d,]+\.\d{2}$", text):
             value = parse_money(text)
             if value is not None:
@@ -142,7 +171,7 @@ def parse_block(block, x_income, x_expense):
                     continue
             continue
 
-        # Описание — всё, что правее колонки "Расход" + 20
+        # Описание
         if x > x_expense + 20:
             if re.match(r"^\d{1,2}$", text):
                 continue
